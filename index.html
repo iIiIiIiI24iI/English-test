@@ -4,6 +4,36 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>오늘의 영어 한 입</title>
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+    import { getDatabase, ref, set, push, get, remove, update, onValue }
+      from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+    // ── Firebase 초기화 ──────────────────────────────────
+    const firebaseConfig = {
+      apiKey: "AIzaSyD1SdDNk84FKx1A9Xa4-CUhD2VXx6aAYnM",
+      authDomain: "english-test-a8f57.firebaseapp.com",
+      databaseURL: "https://english-test-a8f57-default-rtdb.firebaseio.com",
+      projectId: "english-test-a8f57",
+      storageBucket: "english-test-a8f57.firebasestorage.app",
+      messagingSenderId: "942070181919",
+      appId: "1:942070181919:web:314775f58f4a270526a52a"
+    };
+    const app = initializeApp(firebaseConfig);
+    const db  = getDatabase(app);
+
+    // ── 전역 노출 (기존 인라인 스크립트에서 호출) ────────
+    window._db        = db;
+    window._dbRef     = ref;
+    window._dbSet     = set;
+    window._dbPush    = push;
+    window._dbGet     = get;
+    window._dbRemove  = remove;
+    window._dbUpdate  = update;
+    window._dbOnValue = onValue;
+    window._firebaseReady = true;
+    document.dispatchEvent(new Event('firebaseReady'));
+  </script>
   <style>
     /* ===== RESET & BASE ===== */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -664,24 +694,138 @@ const DEFAULT_VOCAB = [
 ];
 
 // =====================================================
-// STORAGE HELPERS
+// IN-MEMORY CACHE (Firebase 동기화용)
 // =====================================================
-function getVocab() {
-  const stored = localStorage.getItem('vocab');
-  if (stored) return JSON.parse(stored);
-  localStorage.setItem('vocab', JSON.stringify(DEFAULT_VOCAB));
-  return DEFAULT_VOCAB;
+let _vocab       = [];   // { _key, English, Korean, date, rate }
+let _examHistory = [];   // { _key, date, rate, score, total, correct, wrong, test:[...] }
+
+function getVocab()   { return _vocab; }
+function getHistory() { return _examHistory; }
+
+// ── Firebase 헬퍼 ──────────────────────────────────
+function fbRef(path)        { return window._dbRef(window._db, path); }
+function fbGet(path)        { return window._dbGet(fbRef(path)); }
+function fbSet(path, val)   { return window._dbSet(fbRef(path), val); }
+function fbPush(path, val)  { return window._dbPush(fbRef(path), val); }
+function fbRemove(path)     { return window._dbRemove(fbRef(path)); }
+function fbUpdate(path, val){ return window._dbUpdate(fbRef(path), val); }
+
+// ── word_list의 다음 숫자 키 계산 ──────────────────
+async function getNextWordKey() {
+  const snap = await fbGet('word_list');
+  if (!snap.exists()) return 1;
+  const keys = Object.keys(snap.val()).map(Number).filter(n => !isNaN(n));
+  return keys.length > 0 ? Math.max(...keys) + 1 : 1;
 }
 
-function getHistory() {
-  const stored = localStorage.getItem('examHistory');
-  return stored ? JSON.parse(stored) : [];
+// ── word_list 로드 ─────────────────────────────────
+async function loadVocab() {
+  const snap = await fbGet('word_list');
+  if (snap.exists()) {
+    const data = snap.val();
+    _vocab = Object.entries(data).map(([k, v]) => ({ _key: k, ...v }));
+  } else {
+    // 최초 실행: 기본 단어 100개를 숫자 키(1~100)로 Firebase에 저장
+    const now = new Date().toISOString();
+    const batch = {};
+    DEFAULT_VOCAB.forEach((w, i) => {
+      batch[i + 1] = { English: w.en, Korean: w.ko, date: now, rate: null };
+    });
+    await fbSet('word_list', batch);
+    const snap2 = await fbGet('word_list');
+    const data2 = snap2.val();
+    _vocab = Object.entries(data2).map(([k, v]) => ({ _key: k, ...v }));
+  }
+  // 내부에서 en/ko 필드로 통일해서 사용
+  _vocab = _vocab.map(v => ({ _key: v._key, en: v.English, ko: v.Korean, date: v.date, rate: v.rate }));
 }
 
-function saveHistory(record) {
-  const history = getHistory();
-  history.push(record);
-  localStorage.setItem('examHistory', JSON.stringify(history));
+// ── exam_list 로드 ─────────────────────────────────
+async function loadHistory() {
+  const snap = await fbGet('exam_list');
+  if (!snap.exists()) { _examHistory = []; return; }
+  const data = snap.val();
+  _examHistory = Object.entries(data).map(([k, v]) => {
+    const testArr = v.test ? Object.values(v.test) : [];
+    const correct = testArr.filter(t => t.correct).length;
+    const total   = testArr.length;
+    const rate    = total > 0 ? Math.round((correct / total) * 100) : 0;
+    const dt      = new Date(v.date);
+    return {
+      _key:    k,
+      date:    v.date,
+      dateStr: dt.toLocaleDateString('ko-KR', {year:'numeric',month:'2-digit',day:'2-digit'}),
+      score:   correct * 10,
+      total,
+      correct,
+      wrong:   total - correct,
+      rate,
+      results: testArr.map(t => ({
+        en:            t.English,
+        ko:            t.Korean,
+        correct:       t.correct,
+        correctAnswer: t.correct ? t.Korean : t.Korean
+      }))
+    };
+  });
+  _examHistory.sort((a, b) => new Date(a.date) - new Date(b.date));
+}
+
+// ── word_list 저장 (단어 추가) ──────────────────────
+async function fbAddWord(en, ko) {
+  const now = new Date().toISOString();
+  const nextKey = await getNextWordKey();
+  await fbSet(`word_list/${nextKey}`, { English: en, Korean: ko, date: now, rate: null });
+  _vocab.unshift({ _key: String(nextKey), en, ko, date: now, rate: null });
+}
+
+// ── word_list 삭제 ─────────────────────────────────
+async function fbDeleteWord(en) {
+  const word = _vocab.find(v => v.en === en);
+  if (!word) return;
+  await fbRemove(`word_list/${word._key}`);
+  _vocab = _vocab.filter(v => v.en !== en);
+}
+
+// ── word_list 수정 ─────────────────────────────────
+async function fbEditWord(originalEn, newEn, newKo) {
+  const word = _vocab.find(v => v.en === originalEn);
+  if (!word) return;
+  await fbUpdate(`word_list/${word._key}`, { English: newEn, Korean: newKo });
+  const idx = _vocab.findIndex(v => v.en === originalEn);
+  if (idx !== -1) _vocab[idx] = { ..._vocab[idx], en: newEn, ko: newKo };
+}
+
+// ── exam_list 저장 ─────────────────────────────────
+async function saveHistory(record) {
+  const testObj = {};
+  record.results.forEach((r, i) => {
+    testObj[i] = { English: r.en, Korean: r.ko, correct: r.correct };
+  });
+  const payload = { date: record.date, test: testObj };
+  const ref = await fbPush('exam_list', payload);
+
+  // 정답률로 word_list의 rate 업데이트
+  const wordRateMap = {};
+  record.results.forEach(r => {
+    if (!wordRateMap[r.en]) wordRateMap[r.en] = { total: 0, correct: 0 };
+    wordRateMap[r.en].total++;
+    if (r.correct) wordRateMap[r.en].correct++;
+  });
+  for (const [en, stat] of Object.entries(wordRateMap)) {
+    const word = _vocab.find(v => v.en === en);
+    if (!word) continue;
+    const prevRate = word.rate || 0;
+    const prevTotal = word._rateTotal || 0;
+    const newTotal  = prevTotal + stat.total;
+    const newCorrect = Math.round(prevRate / 100 * prevTotal) + stat.correct;
+    const newRate = Math.round((newCorrect / newTotal) * 100);
+    await fbUpdate(`word_list/${word._key}`, { rate: newRate });
+    word.rate = newRate;
+    word._rateTotal = newTotal;
+  }
+
+  _examHistory.push({ ...record, _key: ref.key });
 }
 
 // =====================================================
@@ -839,13 +983,12 @@ function nextQuestion() {
   }
 }
 
-function showResult() {
+async function showResult() {
   const total = examQuestions.length;
   const correct = examResults.filter(r => r.correct).length;
   const wrong = total - correct;
   const rate = Math.round((correct / total) * 100);
 
-  // Save to history
   const now = new Date();
   const record = {
     date: now.toISOString(),
@@ -857,7 +1000,7 @@ function showResult() {
     rate,
     results: examResults
   };
-  saveHistory(record);
+  await saveHistory(record);
 
   // Update result screen
   document.getElementById('result-score-num').textContent = examScore;
@@ -989,7 +1132,7 @@ function closeAddWordModalDirect() {
   document.getElementById('add-modal-overlay').classList.remove('open');
 }
 
-function submitAddWord() {
+async function submitAddWord() {
   const enInput = document.getElementById('input-en');
   const koInput = document.getElementById('input-ko');
   const en = enInput.value.trim().toLowerCase();
@@ -1020,24 +1163,21 @@ function submitAddWord() {
     return;
   }
 
-  vocab.unshift({ en, ko });
-  localStorage.setItem('vocab', JSON.stringify(vocab));
+  await fbAddWord(en, ko);
 
   closeAddWordModalDirect();
   renderVocabList(document.getElementById('vocab-search-input').value);
   updateMainStats();
 
-  // Brief success toast
   showToast(`"${en}" 단어가 추가되었습니다! 🎉`);
 }
 
 // =====================================================
 // DELETE WORD
 // =====================================================
-function deleteWord(en) {
+async function deleteWord(en) {
   if (!confirm(`"${en}" 단어를 삭제하시겠습니까?`)) return;
-  const vocab = getVocab().filter(v => v.en !== en);
-  localStorage.setItem('vocab', JSON.stringify(vocab));
+  await fbDeleteWord(en);
   renderVocabList(document.getElementById('vocab-search-input').value);
   updateMainStats();
   showToast(`"${en}" 단어가 삭제되었습니다`);
@@ -1072,7 +1212,7 @@ function closeEditWordModalDirect() {
   document.getElementById('edit-modal-overlay').classList.remove('open');
 }
 
-function submitEditWord() {
+async function submitEditWord() {
   const originalEn = document.getElementById('edit-original-en').value;
   const newEn = document.getElementById('edit-input-en').value.trim().toLowerCase();
   const newKo = document.getElementById('edit-input-ko').value.trim();
@@ -1101,11 +1241,7 @@ function submitEditWord() {
     return;
   }
 
-  const idx = vocab.findIndex(v => v.en === originalEn);
-  if (idx !== -1) {
-    vocab[idx] = { en: newEn, ko: newKo };
-    localStorage.setItem('vocab', JSON.stringify(vocab));
-  }
+  await fbEditWord(originalEn, newEn, newKo);
 
   closeEditWordModalDirect();
   renderVocabList(document.getElementById('vocab-search-input').value);
@@ -1512,15 +1648,50 @@ function closeModalDirect() {
 // =====================================================
 // INIT
 // =====================================================
-document.addEventListener('DOMContentLoaded', () => {
-  getVocab(); // initialize default vocab if needed
-  updateMainStats();
+function showLoadingOverlay(show) {
+  let el = document.getElementById('loading-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'loading-overlay';
+    el.style.cssText = `
+      position:fixed; inset:0; background:rgba(248,250,252,0.92);
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      z-index:9999; gap:16px;
+    `;
+    el.innerHTML = `
+      <div style="width:48px;height:48px;border:4px solid #E2E8F0;border-top-color:#4F46E5;
+        border-radius:50%;animation:spin 0.8s linear infinite;"></div>
+      <p style="color:#64748B;font-size:0.95rem;font-weight:600;">데이터를 불러오는 중...</p>
+      <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+    `;
+    document.body.appendChild(el);
+  }
+  el.style.display = show ? 'flex' : 'none';
+}
 
-  // Override vocab button to render list
+async function initApp() {
+  showLoadingOverlay(true);
+  try {
+    await Promise.all([loadVocab(), loadHistory()]);
+  } catch (e) {
+    console.error('Firebase 로드 실패:', e);
+    showToast('데이터 로드에 실패했습니다. 새로고침 해주세요.');
+  }
+  showLoadingOverlay(false);
+  updateMainStats();
+}
+
+document.addEventListener('DOMContentLoaded', () => {
   document.querySelector('.btn-main.vocab').onclick = () => {
     renderVocabList('');
     showScreen('screen-vocab');
   };
+
+  if (window._firebaseReady) {
+    initApp();
+  } else {
+    document.addEventListener('firebaseReady', initApp);
+  }
 });
 </script>
 </body>
